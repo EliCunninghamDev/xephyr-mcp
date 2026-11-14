@@ -105,6 +105,36 @@ impl Target {
             self.backend.kind().as_str()
         )
     }
+
+    /// True while this target still names the session running on its display.
+    ///
+    /// Display numbers are reused.  A target kept from a session that has
+    /// exited can therefore start pointing at a newer session, which would
+    /// make two panes capture the same desktop.  For X11 the session marker
+    /// on the root window is the authoritative owner; for Wayland the
+    /// per-session sway socket is.
+    fn is_live(&self) -> bool {
+        match &self.backend {
+            Backend::X11 { display } => {
+                let Ok((conn, screen_num)) = x11::connect(display) else {
+                    return false;
+                };
+                let marker = screenshot::session_marker(&conn, screen_num)
+                    .and_then(|text| serde_json::from_str::<State>(&text).ok());
+                match (&self.session_id, marker) {
+                    (Some(wanted), Some(state)) => state.session_id == *wanted,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                }
+            }
+            Backend::Wayland {
+                swaysock, output, ..
+            } => {
+                let expected = (!output.is_empty()).then_some(output.as_str());
+                crate::sway::output_size(swaysock, expected).is_ok()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -294,7 +324,13 @@ fn discover_sessions() -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
     for state in state::list_sessions() {
         if let Some(target) = target_from_state(&state) {
-            targets.push(target);
+            // A state file can outlive its server and its display number can
+            // be reused.  Only list it while the display still identifies
+            // this session, otherwise a stale entry and the live session
+            // would render the same desktop twice.
+            if target.is_live() {
+                targets.push(target);
+            }
         }
     }
     for target in scan_displays(None) {
@@ -1306,9 +1342,16 @@ impl Viewer {
 
     fn refresh_sessions(&mut self) {
         let mut sessions = discover_sessions();
-        if let Some(pinned) = &self.pinned {
-            if !sessions.iter().any(|target| target.key() == pinned.key()) {
-                sessions.push(pinned.clone());
+        if let Some(pinned) = self.pinned.clone() {
+            if sessions.iter().any(|target| target.key() == pinned.key()) {
+                // The pinned target is still discoverable.
+            } else if pinned.is_live() {
+                sessions.push(pinned);
+            } else {
+                // The session this viewer started on is gone.  Do not keep a
+                // dead target: its display can be reused by a newer session
+                // and would then be captured twice.
+                self.pinned = None;
             }
         }
         sessions.sort_by_key(|target| std::cmp::Reverse(target.started_at));
