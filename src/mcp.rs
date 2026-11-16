@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// Agent-facing guidance returned in the MCP `initialize` response.
-pub const INSTRUCTIONS: &str = "Use xephyr-mcp for GUI and desktop testing on a private, disposable desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. The default backend is X11 (Xephyr or Xvfb); backend=wayland uses sway, headless or nested. Nothing here touches the host desktop, host cursor, host clipboard, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Sessions are headless by default; pass visible=true only when a person needs a watchable nested window, and never launch the viewer or a visible session unless asked. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. The nested pointer is overlaid by default; pass cursor=false when it obscures something or when a Wayland window capture cannot include it. Prefer a11y_find/a11y_click over pixels for forms, buttons, and menus.\n\nAfter an action that changes the UI, call wait_for_idle before the next screenshot or click instead of polling. Use wait_for to block on a window title/class, a process exit, a screen-stable state, a changed region, or a file. Use screenshot region/window_id for legible native-resolution crops, clipboard_set/clipboard_get for long or Unicode text, and list_processes/tail_log when an app fails to start. Call diagnose first when an environmental tool is missing. For repeated clicks use count; hold ctrl/shift/alt with modifiers; use mouse_down/mouse_up and key_down/key_up for state that spans calls. window_state changes minimize/maximize/fullscreen/always-on-top; resize_display works on both X11 and Wayland sessions. screenshot marks=true numbers actionable elements and click(mark=N) activates them through accessibility when possible. Every call is traced; use trace_tail to review what happened, and launch_status to check whether a launched process is still running or has an exit code. While a viewer has human control, pointer/keyboard/accessibility tools are refused; call wait_for_control(owner=\"agent\") to block until it is released. Process lifetime: launch starts a detached process group that keeps running after the call returns and after its window closes; a finished screenshot or a disappeared window does not mean the process exited. Before finishing a task, call kill_process with all=true (or display_stop, which reaps apps, window manager, X server, and buses). If an app is meant to stay alive, say so explicitly. display_start persist_home=true keeps app profiles, and XEPHYR_MCP_IDLE_TIMEOUT_SECS enables auto-teardown.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'xephyr-mcp-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses.";
+pub const INSTRUCTIONS: &str = "Use xephyr-mcp for GUI and desktop testing on a private, disposable desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. The default backend is X11 (Xephyr or Xvfb); backend=wayland uses sway, headless or nested. Nothing here touches the host desktop, host cursor, host clipboard, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Sessions are headless by default; pass visible=true only when a person needs a watchable nested window, and never launch the viewer or a visible session unless asked. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. The nested pointer is overlaid by default; pass cursor=false when it obscures something or when a Wayland window capture cannot include it. Prefer a11y_find/a11y_click over pixels for forms, buttons, and menus.\n\nAfter an action that changes the UI, call wait_for_idle before the next screenshot or click instead of polling. Use wait_for to block on a window title/class, a process exit, a screen-stable state, a changed region, or a file. Use screenshot region/window_id for legible native-resolution crops, clipboard_set/clipboard_get for long or Unicode text, and list_processes/tail_log when an app fails to start. Call diagnose first when an environmental tool is missing. For repeated clicks use count; hold ctrl/shift/alt with modifiers; use mouse_down/mouse_up and key_down/key_up for state that spans calls. window_state changes minimize/maximize/fullscreen/always-on-top; resize_display works on both X11 and Wayland sessions. screenshot marks=true numbers actionable elements and click(mark=N) activates them through accessibility when possible. Every call is traced; use trace_tail to review what happened, trace_stats for failures, error codes, latency, and stop reasons, and launch_status to check whether a launched process is still running or has an exit code. Calling display_start again with the same size, backend, and visible returns the running session with already_running=true instead of failing; it can also update idle_timeout_secs and max_lifetime_secs without restarting the desktop. Pass idle_timeout_secs=0 for long host-side work, and note that a live process started with launch counts as activity. A no-display error names why the previous desktop stopped; diagnose includes the same last_stop record. While a viewer has human control, pointer/keyboard/accessibility tools are refused; call wait_for_control(owner=\"agent\") to block until it is released. Process lifetime: launch starts a detached process group that keeps running after the call returns and after its window closes; a finished screenshot or a disappeared window does not mean the process exited. Before finishing a task, call kill_process with all=true (or display_stop, which reaps apps, window manager, X server, and buses). If an app is meant to stay alive, say so explicitly. display_start persist_home=true keeps app profiles, and XEPHYR_MCP_IDLE_TIMEOUT_SECS enables auto-teardown.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'xephyr-mcp-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses.";
 
 pub enum Content {
     Text(String),
@@ -197,20 +197,20 @@ async fn watchdog(manager: Arc<DisplayManager>) {
                 "[xephyr-mcp] viewer requested stop of {} ({})",
                 session.info.display, session.info.session_id
             );
-            let path = crate::trace::path_for(Some(&session.info.session_id));
-            let entry = crate::trace::entry(
-                "viewer_stop",
-                &json!({}),
-                Some(&session.info.session_id),
-                Some(&session.info.display),
-                0,
-                true,
-                None,
-                None,
-                None,
-            );
-            let _ = crate::trace::append(&path, entry);
-            if let Err(err) = manager.stop().await {
+            let result = manager.stop_with_reason("viewer_request").await;
+            if let Err(err) = result {
+                let _ = crate::trace::append(
+                    &crate::trace::session_path(&session.info.session_id),
+                    crate::trace::event(
+                        "session_stop_failed",
+                        json!({
+                            "reason": "viewer_request",
+                            "session_id": session.info.session_id,
+                            "display": session.info.display,
+                            "error": format!("{err:#}"),
+                        }),
+                    ),
+                );
                 eprintln!("[xephyr-mcp] viewer stop failed: {err:#}");
             }
             continue;
@@ -218,31 +218,34 @@ async fn watchdog(manager: Arc<DisplayManager>) {
 
         // Timeouts are cheap to check; the stop request is the latency-critical
         // path and runs every second.
-        if tick % 10 != 0 || (manager.idle_timeout.is_none() && manager.max_lifetime.is_none()) {
+        if tick % 10 != 0 || (session.idle_timeout().is_none() && session.max_lifetime().is_none())
+        {
             continue;
         }
         let running_for = std::time::Duration::from_secs(
             crate::state::now().saturating_sub(session.info.started_at),
         );
-        if let Some(reason) = manager.should_auto_stop(running_for) {
+        if let Some(reason) = manager.should_auto_stop(&session, running_for) {
             eprintln!(
-                "[xephyr-mcp] watchdog: stopping {} ({reason})",
-                session.info.display
+                "[xephyr-mcp] watchdog: stopping {} ({reason}); idle={:?}s running_launches={}",
+                session.info.display,
+                manager.idle_remaining(&session),
+                session.live_launch_count()
             );
-            let path = crate::trace::path_for(Some(&session.info.session_id));
-            let entry = crate::trace::entry(
-                "watchdog",
-                &json!({ "reason": reason }),
-                Some(&session.info.session_id),
-                Some(&session.info.display),
-                0,
-                true,
-                None,
-                None,
-                None,
-            );
-            let _ = crate::trace::append(&path, entry);
-            if let Err(err) = manager.stop().await {
+            let result = manager.stop_with_reason(reason).await;
+            if let Err(err) = result {
+                let _ = crate::trace::append(
+                    &crate::trace::session_path(&session.info.session_id),
+                    crate::trace::event(
+                        "session_stop_failed",
+                        json!({
+                            "reason": reason,
+                            "session_id": session.info.session_id,
+                            "display": session.info.display,
+                            "error": format!("{err:#}"),
+                        }),
+                    ),
+                );
                 eprintln!("[xephyr-mcp] watchdog stop failed: {err:#}");
             }
         }

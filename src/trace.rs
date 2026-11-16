@@ -9,7 +9,7 @@ use crate::env;
 use crate::state;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,9 @@ pub fn session_path(session_id: &str) -> PathBuf {
     traces_dir().join(format!("{session_id}.jsonl"))
 }
 
-fn server_path() -> PathBuf {
+/// The trace file for this server process.  It collects calls made before a
+/// session exists, plus lifecycle events that are not tied to a session.
+pub fn server_path() -> PathBuf {
     traces_dir().join(format!("server-{}.jsonl", std::process::id()))
 }
 
@@ -104,9 +106,14 @@ pub fn entry(
         "display": display,
         "duration_ms": duration_ms,
         "ok": ok,
+        "server_pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
     });
     if let Some(error) = error {
         record["error"] = json!(error.chars().take(2048).collect::<String>());
+        // A stable category lets `trace_stats` group failures without parsing
+        // prose.  The full message stays in `error` for humans.
+        record["error_code"] = json!(error_code(error));
     }
     if let Some(hash) = before_hash {
         record["before_hash"] = json!(hash);
@@ -118,6 +125,283 @@ pub fn entry(
         }
     }
     record
+}
+
+/// Build a lifecycle record (server start, session stop, panic).  Events are
+/// deliberately not tool calls so failure statistics stay meaningful.
+pub fn event(name: &str, fields: Value) -> Value {
+    let mut record = json!({
+        "ts": state::now(),
+        "event": name,
+        "server_pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    if let Value::Object(map) = fields {
+        for (key, value) in map {
+            record[key] = value;
+        }
+    }
+    record
+}
+
+/// Append an event to this server's trace.  Like [`append`], failures are the
+/// caller's to ignore: telemetry must never change the outcome of a call.
+pub fn record_event(name: &str, fields: Value) {
+    let _ = append(&server_path(), event(name, fields));
+}
+
+/// Stable error categories used by the trace and `trace_stats`.
+///
+/// The mapping is intentionally prefix-based: callers see the original
+/// message, while dashboards can count `no_display` or
+/// `display_already_running` without depending on exact wording.
+pub fn error_code(message: &str) -> &'static str {
+    let text = message.trim().to_ascii_lowercase();
+    let starts = |prefix: &str| text.starts_with(prefix);
+    let contains = |needle: &str| text.contains(needle);
+    if starts("no nested display is running") || starts("no display is running") {
+        "no_display"
+    } else if starts("a nested display is already running")
+        || starts("a display is already running")
+    {
+        "display_already_running"
+    } else if starts("unknown argument") {
+        "unknown_argument"
+    } else if starts("missing ") || contains(" is required") {
+        "missing_argument"
+    } else if starts("invalid")
+        || starts("backend must")
+        || starts("width and height")
+        || contains("must be ")
+        || contains("must have ")
+    {
+        "invalid_argument"
+    } else if contains("was not found; install") || starts("xdotool was not found") {
+        "missing_tool"
+    } else if contains("human control") || contains("control is owned") {
+        "human_control"
+    } else if contains("was not started by launch") {
+        "not_launched"
+    } else if contains("timed out") || contains("timeout") {
+        "timeout"
+    } else if contains("not supported") || contains("not available") {
+        "unsupported"
+    } else if contains("no such") || contains("does not exist") {
+        "not_found"
+    } else {
+        "internal"
+    }
+}
+
+/// Aggregate every trace into the counters an operator actually needs: call
+/// volume, failure rate, error categories, latency, and lifecycle stops.
+///
+/// `session_id` restricts the scan to one session file; otherwise the newest
+/// `max_files` JSONL traces are read.  Aggregation is bounded and ignores
+/// malformed lines so a partially written trace cannot break diagnostics.
+pub fn summary(session_id: Option<&str>, max_files: usize, recent: usize) -> Value {
+    summary_in(&traces_dir(), session_id, max_files, recent)
+}
+
+pub fn summary_in(dir: &Path, session_id: Option<&str>, max_files: usize, recent: usize) -> Value {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct ToolStat {
+        calls: u64,
+        failures: u64,
+        durations: Vec<u64>,
+        codes: BTreeMap<String, u64>,
+        last_error: Option<String>,
+        last_error_ts: u64,
+    }
+
+    let max_files = max_files.clamp(1, 1000);
+    let recent = recent.clamp(1, 200);
+    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
+
+    if let Some(id) = session_id {
+        let path = dir.join(format!("{id}.jsonl"));
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+            files.push((modified, path));
+        }
+    } else if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+                continue;
+            };
+            files.push((modified, path));
+        }
+    }
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    files.truncate(max_files);
+
+    let mut tools: BTreeMap<String, ToolStat> = BTreeMap::new();
+    let mut events: BTreeMap<String, u64> = BTreeMap::new();
+    let mut stop_reasons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut error_codes: BTreeMap<String, u64> = BTreeMap::new();
+    let mut recent_failures: Vec<Value> = Vec::new();
+    let mut calls = 0u64;
+    let mut failures = 0u64;
+    let mut scanned = 0u64;
+    let mut since: Option<u64> = None;
+    let mut until: Option<u64> = None;
+
+    for (_, path) in &files {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        scanned += 1;
+        for line in BufReader::new(file).lines().take(100_000) {
+            let Ok(line) = line else {
+                break;
+            };
+            if line.len() > 1024 * 1024 {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let ts = record.get("ts").and_then(Value::as_u64).unwrap_or(0);
+            if ts > 0 {
+                since = Some(since.map_or(ts, |value| value.min(ts)));
+                until = Some(until.map_or(ts, |value| value.max(ts)));
+            }
+
+            if let Some(name) = record.get("event").and_then(Value::as_str) {
+                *events.entry(name.to_string()).or_insert(0) += 1;
+                if name == "session_stop" {
+                    if let Some(reason) = record.get("reason").and_then(Value::as_str) {
+                        *stop_reasons.entry(reason.to_string()).or_insert(0) += 1;
+                    }
+                }
+                continue;
+            }
+
+            let Some(tool) = record.get("tool").and_then(Value::as_str) else {
+                continue;
+            };
+            // Older builds recorded lifecycle stops as tool rows.  Keep those
+            // out of call/failure statistics and fold them into stop reasons.
+            if tool == "watchdog" || tool == "viewer_stop" {
+                *events.entry("session_stop".to_string()).or_insert(0) += 1;
+                let reason = if tool == "viewer_stop" {
+                    "viewer_request".to_string()
+                } else {
+                    record
+                        .get("args")
+                        .and_then(|args| args.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("watchdog")
+                        .replace(' ', "_")
+                };
+                *stop_reasons.entry(reason).or_insert(0) += 1;
+                continue;
+            }
+            let ok = record.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            calls += 1;
+            let stat = tools.entry(tool.to_string()).or_default();
+            stat.calls += 1;
+            if let Some(duration) = record.get("duration_ms").and_then(Value::as_u64) {
+                stat.durations.push(duration);
+            }
+            if ok {
+                continue;
+            }
+            failures += 1;
+            stat.failures += 1;
+            let code = record
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    record
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(error_code)
+                        .unwrap_or("unclassified")
+                        .to_string()
+                });
+            *stat.codes.entry(code.clone()).or_insert(0) += 1;
+            *error_codes.entry(code.clone()).or_insert(0) += 1;
+            let message = record
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("tool error");
+            if ts >= stat.last_error_ts {
+                stat.last_error_ts = ts;
+                stat.last_error = Some(message.chars().take(512).collect());
+            }
+            recent_failures.push(json!({
+                "ts": ts,
+                "tool": tool,
+                "error_code": code,
+                "error": message.chars().take(512).collect::<String>(),
+                "session_id": record.get("session_id"),
+                "display": record.get("display"),
+            }));
+        }
+    }
+
+    let mut tool_stats: Vec<Value> = Vec::new();
+    for (name, mut stat) in tools {
+        stat.durations.sort_unstable();
+        let percentile = |percent: f64| -> u64 {
+            if stat.durations.is_empty() {
+                return 0;
+            }
+            let rank = ((percent / 100.0) * stat.durations.len() as f64).ceil() as usize;
+            let index = rank.saturating_sub(1).min(stat.durations.len() - 1);
+            stat.durations[index]
+        };
+        tool_stats.push(json!({
+            "tool": name,
+            "calls": stat.calls,
+            "failures": stat.failures,
+            "failure_rate": ratio(stat.failures, stat.calls),
+            "p50_ms": percentile(50.0),
+            "p95_ms": percentile(95.0),
+            "max_ms": stat.durations.last().copied().unwrap_or(0),
+            "error_codes": stat.codes,
+            "last_error": stat.last_error,
+            "last_error_ts": (stat.last_error_ts > 0).then_some(stat.last_error_ts),
+        }));
+    }
+    tool_stats.sort_by_key(|item| {
+        std::cmp::Reverse(item.get("calls").and_then(Value::as_u64).unwrap_or(0))
+    });
+
+    recent_failures
+        .sort_by_key(|item| std::cmp::Reverse(item.get("ts").and_then(Value::as_u64).unwrap_or(0)));
+    recent_failures.truncate(recent);
+
+    json!({
+        "trace_dir": dir.display().to_string(),
+        "session_id": session_id,
+        "files": scanned,
+        "since": since,
+        "until": until,
+        "calls": calls,
+        "failures": failures,
+        "failure_rate": ratio(failures, calls),
+        "events": events,
+        "stop_reasons": stop_reasons,
+        "error_codes": error_codes,
+        "tools": tool_stats,
+        "recent_failures": recent_failures,
+    })
+}
+
+fn ratio(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (part as f64 / total as f64 * 10_000.0).round() / 10_000.0
+    }
 }
 
 /// Tools whose call can plausibly change the frame.  Only these pay the cost
@@ -294,5 +578,93 @@ mod tests {
         assert!(should_hash("type"));
         assert!(!should_hash("screenshot"));
         assert!(!should_hash("diagnose"));
+    }
+
+    #[test]
+    fn error_codes_group_known_failures() {
+        assert_eq!(
+            error_code("no nested display is running; call display_start first"),
+            "no_display"
+        );
+        assert_eq!(
+            error_code(
+                "a nested display is already running at :100 (1280x800); call display_stop first"
+            ),
+            "display_already_running"
+        );
+        assert_eq!(
+            error_code("unknown argument \"idle_timeout_secs\""),
+            "unknown_argument"
+        );
+        assert_eq!(
+            error_code("xdotool was not found; install it to use input tools"),
+            "missing_tool"
+        );
+        assert_eq!(
+            error_code("pid 42 was not started by launch in this session"),
+            "not_launched"
+        );
+        assert_eq!(error_code("something exploded"), "internal");
+    }
+
+    #[test]
+    fn summary_counts_calls_failures_and_events() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("xephyr-mcp-trace-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("abc.jsonl");
+
+        append(
+            &path,
+            entry(
+                "screenshot",
+                &json!({}),
+                Some("abc"),
+                Some(":100"),
+                5,
+                false,
+                Some("no nested display is running; call display_start first"),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        append(
+            &path,
+            entry(
+                "screenshot",
+                &json!({}),
+                Some("abc"),
+                Some(":100"),
+                7,
+                true,
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        append(
+            &path,
+            event("session_stop", json!({"reason": "idle_timeout"})),
+        )
+        .unwrap();
+
+        let summary = summary_in(&dir, None, 10, 5);
+        assert_eq!(summary["calls"], 2);
+        assert_eq!(summary["failures"], 1);
+        assert_eq!(summary["error_codes"]["no_display"], 1);
+        assert_eq!(summary["events"]["session_stop"], 1);
+        assert_eq!(summary["stop_reasons"]["idle_timeout"], 1);
+        assert_eq!(summary["tools"][0]["tool"], "screenshot");
+        assert_eq!(summary["tools"][0]["calls"], 2);
+        assert_eq!(summary["tools"][0]["failures"], 1);
+        assert_eq!(summary["tools"][0]["p95_ms"], 7);
+        assert_eq!(summary["recent_failures"][0]["error_code"], "no_display");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

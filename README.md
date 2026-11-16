@@ -66,10 +66,16 @@ never used.
   and sway window state changes, held mouse/key input, persistent per-session
   HOME, an auto-teardown watchdog, and explicit agent/human input arbitration
   with `wait_for_control`.
-- **Trace and marks.** Every tool call is appended to
+- **Trace, telemetry, and marks.** Every tool call is appended to
 `$XDG_RUNTIME_DIR/xephyr-mcp/traces/<session_id>.jsonl` with the sanitized
-arguments, duration, outcome, and before/after frame hashes for screen-changing
-tools. Traces survive `display_stop`; read them with `trace_tail`.
+arguments, duration, outcome, a stable `error_code` on failures, and
+before/after frame hashes for screen-changing tools. Lifecycle events
+(`session_stop`, `panic`, server start/exit) are recorded separately so they do
+not inflate call counts. Traces survive `display_stop`; read them with
+`trace_tail`, or aggregate failures, latency, error codes, and stop reasons
+with `trace_stats`. `diagnose` also returns the active watchdog limits, the
+reason for the last teardown, and a telemetry digest. The same summary is
+available offline as `xephyr-mcp --trace-stats [session_id]`.
 
 Set `XEPHYR_MCP_TRACE_SCREENSHOTS=1` to also save the before/after frame of each
 screen-changing call under `traces/steps/<session>/`. The trace entry then
@@ -113,9 +119,17 @@ reaper stores its exit status, so `launch_status` can report `running`,
 
 `persist_home=true` on `display_start` keeps `HOME` and XDG directories under
 `$XDG_RUNTIME_DIR/xephyr-mcp/homes/<session_id>` across restarts with the same
-session id. Set `XEPHYR_MCP_IDLE_TIMEOUT_SECS` or
-`XEPHYR_MCP_MAX_LIFETIME_SECS` to enable the watchdog, which tears down a
-desktop when no tool call is active and the limit has elapsed.
+session id. `XEPHYR_MCP_IDLE_TIMEOUT_SECS` and
+`XEPHYR_MCP_MAX_LIFETIME_SECS` set server-wide watchdog defaults; pass
+`idle_timeout_secs` or `max_lifetime_secs` to `display_start` to override them
+per session, with `0` disabling a limit. A live process started with `launch`
+counts as activity, so the idle watchdog never kills a desktop while an
+application is still running. Calling `display_start` again with the same size,
+backend, and visibility returns the running session with `already_running=true`
+and can extend its watchdog limits without restarting the desktop; a request
+that differs explains whether to use `resize_display` or `display_stop`.
+`diagnose` and the no-display error report the reason and age of the last
+teardown, so an idle-timeout stop is no longer silent.
 
 The clipboard tools own the selection directly: on X11 a background thread
 answers `SelectionRequest` for `CLIPBOARD`, and on Wayland a

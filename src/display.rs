@@ -245,6 +245,10 @@ pub struct Session {
     /// Exit statuses keyed by launch pid.
     exits: Mutex<std::collections::HashMap<u32, ExitInfo>>,
     launch_seq: AtomicU64,
+    /// Per-session watchdog limits in seconds; 0 disables the limit.  These
+    /// override the server-wide defaults from the environment.
+    idle_timeout_secs: AtomicU64,
+    max_lifetime_secs: AtomicU64,
 }
 
 impl Session {
@@ -324,6 +328,45 @@ impl Session {
         self.launched.lock().map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Update the watchdog limits for this session.  `None` disables a limit;
+    /// this is how `display_start` can extend a session that is already
+    /// running without tearing it down.
+    pub fn set_watchdog(&self, idle: Option<Duration>, max: Option<Duration>) {
+        self.idle_timeout_secs.store(
+            idle.map(|value| value.as_secs()).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.max_lifetime_secs.store(
+            max.map(|value| value.as_secs()).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        match self.idle_timeout_secs.load(Ordering::Relaxed) {
+            0 => None,
+            seconds => Some(Duration::from_secs(seconds)),
+        }
+    }
+
+    pub fn max_lifetime(&self) -> Option<Duration> {
+        match self.max_lifetime_secs.load(Ordering::Relaxed) {
+            0 => None,
+            seconds => Some(Duration::from_secs(seconds)),
+        }
+    }
+
+    /// Number of processes started with `launch` that are still alive.  The
+    /// idle watchdog treats these as activity, so a long-running application
+    /// cannot be killed just because the agent makes no MCP calls while it
+    /// works.
+    pub fn live_launch_count(&self) -> usize {
+        self.launched()
+            .iter()
+            .filter(|item| self.running(item.pid))
+            .count()
+    }
+
     pub fn next_launch_seq(&self) -> u64 {
         self.launch_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -369,13 +412,50 @@ impl Session {
 pub struct StartReport {
     pub info: SessionInfo,
     pub warnings: Vec<String>,
+    /// True when the request matched a desktop that was already running and
+    /// the existing session was returned instead of starting another one.
+    pub already_running: bool,
+    pub idle_timeout_secs: Option<u64>,
+    pub max_lifetime_secs: Option<u64>,
 }
 
 impl StartReport {
     pub fn to_json(&self) -> Value {
         let mut value = self.info.to_json();
         value["warnings"] = json!(self.warnings);
+        value["already_running"] = json!(self.already_running);
+        value["idle_timeout_secs"] = json!(self.idle_timeout_secs);
+        value["max_lifetime_secs"] = json!(self.max_lifetime_secs);
         value
+    }
+}
+
+/// Why and when the last desktop owned by this server was torn down.  The
+/// watchdog records this so a later "no display is running" error can explain
+/// what happened instead of leaving the caller to guess.
+#[derive(Clone, Debug)]
+pub struct LastStop {
+    pub session_id: String,
+    pub display: String,
+    pub reason: String,
+    pub at: u64,
+    pub signalled: usize,
+}
+
+impl LastStop {
+    pub fn age_secs(&self) -> u64 {
+        state::now().saturating_sub(self.at)
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "session_id": self.session_id,
+            "display": self.display,
+            "reason": self.reason,
+            "at": self.at,
+            "age_secs": self.age_secs(),
+            "signalled": self.signalled,
+        })
     }
 }
 
@@ -404,6 +484,8 @@ pub struct DisplayManager {
     last_activity: AtomicU64,
     /// Calls currently executing; the watchdog must not stop a busy desktop.
     active_calls: AtomicU64,
+    /// Most recent teardown, for `diagnose` and clearer no-display errors.
+    last_stop: std::sync::Mutex<Option<LastStop>>,
     pub idle_timeout: Option<Duration>,
     pub max_lifetime: Option<Duration>,
 }
@@ -422,6 +504,7 @@ impl DisplayManager {
             tools: Tools::discover(),
             last_activity: AtomicU64::new(state::now()),
             active_calls: AtomicU64::new(0),
+            last_stop: std::sync::Mutex::new(None),
             idle_timeout: seconds("XEPHYR_MCP_IDLE_TIMEOUT_SECS"),
             max_lifetime: seconds("XEPHYR_MCP_MAX_LIFETIME_SECS"),
         }
@@ -441,23 +524,58 @@ impl DisplayManager {
         self.last_activity.store(state::now(), Ordering::Relaxed);
     }
 
+    pub fn last_stop(&self) -> Option<LastStop> {
+        self.last_stop.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Seconds until the idle watchdog would stop `session`, if a limit is set.
+    pub fn idle_remaining(&self, session: &Session) -> Option<u64> {
+        let limit = session.idle_timeout()?;
+        let idle = state::now().saturating_sub(self.last_activity.load(Ordering::Relaxed));
+        Some(limit.as_secs().saturating_sub(idle))
+    }
+
+    fn record_last_stop(&self, info: &SessionInfo, reason: &str, report: &StopReport) {
+        if let Ok(mut slot) = self.last_stop.lock() {
+            *slot = Some(LastStop {
+                session_id: info.session_id.clone(),
+                display: info.display.clone(),
+                reason: reason.to_string(),
+                at: state::now(),
+                signalled: report.processes.len(),
+            });
+        }
+    }
+
     /// True when the idle timeout or maximum lifetime has elapsed and no tool
-    /// call is in flight.
-    pub fn should_auto_stop(&self, running_for: Duration) -> Option<&'static str> {
+    /// call is in flight.  A live `launch` process counts as activity so a
+    /// long-running application is not killed by a timer that only observes
+    /// MCP calls.
+    pub fn should_auto_stop(
+        &self,
+        session: &Session,
+        running_for: Duration,
+    ) -> Option<&'static str> {
         if self.active_calls.load(Ordering::Relaxed) > 0 {
             return None;
         }
-        if let Some(limit) = self.idle_timeout {
+        if let Some(limit) = session.max_lifetime() {
+            if running_for >= limit {
+                return Some("max_lifetime");
+            }
+        }
+        if session.live_launch_count() > 0 {
+            // A running application is activity.  Keep the idle clock fresh so
+            // the agent still gets a full grace period after it exits.
+            self.touch();
+            return None;
+        }
+        if let Some(limit) = session.idle_timeout() {
             let idle = Duration::from_secs(
                 state::now().saturating_sub(self.last_activity.load(Ordering::Relaxed)),
             );
             if idle >= limit {
-                return Some("idle timeout");
-            }
-        }
-        if let Some(limit) = self.max_lifetime {
-            if running_for >= limit {
-                return Some("maximum lifetime");
+                return Some("idle_timeout");
             }
         }
         None
@@ -477,6 +595,8 @@ impl DisplayManager {
         persist_home: bool,
         backend: BackendKind,
         xwayland: bool,
+        idle_timeout_secs: Option<u64>,
+        max_lifetime_secs: Option<u64>,
     ) -> Result<StartReport> {
         if !(64..=8192).contains(&width) || !(64..=8192).contains(&height) {
             bail!("width and height must be between 64 and 8192 pixels");
@@ -484,6 +604,7 @@ impl DisplayManager {
         if backend == BackendKind::X11 && xwayland {
             bail!("xwayland is only meaningful with backend=\"wayland\"");
         }
+        let requested_session = session_id.clone();
         let session_id = match session_id {
             Some(id) => {
                 validate_session_id(&id)?;
@@ -499,16 +620,59 @@ impl DisplayManager {
             }
             None => generate_session_id(),
         };
+        let requested_idle =
+            idle_timeout_secs.map(|seconds| (seconds > 0).then(|| Duration::from_secs(seconds)));
+        let requested_max =
+            max_lifetime_secs.map(|seconds| (seconds > 0).then(|| Duration::from_secs(seconds)));
 
         let mut guard = self.inner.lock().await;
         if let Some(session) = guard.as_ref() {
+            if start_matches(
+                session,
+                width,
+                height,
+                visible,
+                requested_session.as_deref(),
+                backend,
+                xwayland,
+            ) {
+                // The same desktop is already running.  Treat the call as an
+                // "ensure" operation.  An omitted watchdog option keeps the
+                // session's current limit; an explicit value (including 0 to
+                // disable) updates it without destroying the session.
+                let idle_timeout = requested_idle.unwrap_or_else(|| session.idle_timeout());
+                let max_lifetime = requested_max.unwrap_or_else(|| session.max_lifetime());
+                session.set_watchdog(idle_timeout, max_lifetime);
+                let mut info = session.info.clone();
+                info.width = session.width();
+                info.height = session.height();
+                return Ok(StartReport {
+                    info,
+                    warnings: vec![
+                        "the requested display is already running; returning the existing session"
+                            .into(),
+                    ],
+                    already_running: true,
+                    idle_timeout_secs: idle_timeout.map(|value| value.as_secs()),
+                    max_lifetime_secs: max_lifetime.map(|value| value.as_secs()),
+                });
+            }
             bail!(
-                "a nested display is already running at {} ({}x{}); call display_stop first",
-                session.info.display,
-                session.width(),
-                session.height()
+                "{}",
+                already_running_message(
+                    session,
+                    width,
+                    height,
+                    visible,
+                    backend,
+                    xwayland,
+                    requested_session.as_deref(),
+                )
             );
         }
+
+        let idle_timeout = requested_idle.unwrap_or(self.idle_timeout);
+        let max_lifetime = requested_max.unwrap_or(self.max_lifetime);
 
         let stale = state::cleanup_stale();
         let mut warnings: Vec<String> = stale;
@@ -552,9 +716,21 @@ impl DisplayManager {
             marks: Mutex::new(Vec::new()),
             exits: Mutex::new(std::collections::HashMap::new()),
             launch_seq: AtomicU64::new(0),
+            idle_timeout_secs: AtomicU64::new(
+                idle_timeout.map(|value| value.as_secs()).unwrap_or(0),
+            ),
+            max_lifetime_secs: AtomicU64::new(
+                max_lifetime.map(|value| value.as_secs()).unwrap_or(0),
+            ),
         });
         *guard = Some(session);
-        Ok(StartReport { info, warnings })
+        Ok(StartReport {
+            info,
+            warnings,
+            already_running: false,
+            idle_timeout_secs: idle_timeout.map(|value| value.as_secs()),
+            max_lifetime_secs: max_lifetime.map(|value| value.as_secs()),
+        })
     }
 
     async fn launch_x11(
@@ -1037,13 +1213,20 @@ impl DisplayManager {
     }
 
     pub async fn stop(&self) -> Result<StopReport> {
+        self.stop_with_reason("requested").await
+    }
+
+    /// Stop the desktop and remember why.  The reason (`requested`,
+    /// `idle_timeout`, `max_lifetime`, `viewer_request`, `signal`,
+    /// `server_exit`) is what `diagnose` and later no-display errors report.
+    pub async fn stop_with_reason(&self, reason: &str) -> Result<StopReport> {
         let mut guard = self.inner.lock().await;
         let Some(session) = guard.take() else {
             return Ok(StopReport {
                 stopped: false,
                 display: None,
                 processes: Vec::new(),
-                warnings: vec!["no nested display is running".into()],
+                warnings: vec!["no display is running".into()],
             });
         };
 
@@ -1093,13 +1276,108 @@ impl DisplayManager {
         state::clear(&info.session_id);
         let _ = std::fs::remove_dir_all(&info.runtime_dir);
 
-        Ok(StopReport {
+        let report = StopReport {
             stopped: true,
             display: Some(info.display.clone()),
             processes: pids,
             warnings: Vec::new(),
-        })
+        };
+        self.record_last_stop(&session.info, reason, &report);
+        // Every stop is recorded once, with the reason, so `trace_stats` can
+        // distinguish an explicit display_stop from an idle or viewer stop
+        // even after the session state is gone.
+        let _ = crate::trace::append(
+            &crate::trace::session_path(&session.info.session_id),
+            crate::trace::event(
+                "session_stop",
+                json!({
+                    "reason": reason,
+                    "session_id": session.info.session_id,
+                    "display": session.info.display,
+                    "signalled": report.processes.len(),
+                    "uptime_secs": state::now().saturating_sub(session.info.started_at),
+                }),
+            ),
+        );
+        Ok(report)
     }
+}
+
+/// True when a `display_start` request describes the desktop that is already
+/// running.  Used to make repeated starts idempotent instead of destructive.
+fn start_matches(
+    session: &Session,
+    width: u32,
+    height: u32,
+    visible: bool,
+    requested_session: Option<&str>,
+    backend: BackendKind,
+    xwayland: bool,
+) -> bool {
+    session.info.backend == backend
+        && session.width() == width
+        && session.height() == height
+        && session.info.visible == visible
+        && (backend != BackendKind::Wayland || !xwayland || session.info.xdisplay.is_some())
+        && requested_session.is_none_or(|id| session.info.session_id == id)
+}
+
+/// Explain why a start request did not match the running desktop, and name the
+/// least destructive way to get what the caller asked for.
+fn already_running_message(
+    session: &Session,
+    width: u32,
+    height: u32,
+    visible: bool,
+    backend: BackendKind,
+    xwayland: bool,
+    requested_session: Option<&str>,
+) -> String {
+    let current = format!(
+        "a display is already running for session {:?} at {} ({}x{}, {}, {})",
+        session.info.session_id,
+        session.info.display,
+        session.width(),
+        session.height(),
+        session.info.backend.as_str(),
+        if session.info.visible {
+            "visible"
+        } else {
+            "headless"
+        }
+    );
+    let hint = if requested_session.is_some_and(|id| id != session.info.session_id) {
+        format!(
+            "The running desktop uses session {:?}; call display_stop first to start a session with a different id.",
+            session.info.session_id
+        )
+    } else if session.info.backend != backend {
+        format!(
+            "The running desktop uses backend={}; call display_stop, then display_start with backend={}.",
+            session.info.backend.as_str(),
+            backend.as_str()
+        )
+    } else if session.info.visible != visible {
+        format!(
+            "Call display_stop, then display_start with visible={visible}. If you only need a different size, the desktop can stay up."
+        )
+    } else if session.width() != width || session.height() != height {
+        if session.info.xserver == "Xvfb" {
+            format!(
+                "This headless Xvfb desktop cannot be resized; call display_stop, then display_start with width={width}, height={height}."
+            )
+        } else {
+            format!(
+                "Call resize_display with width={width}, height={height} to resize it, or display_stop to start a new desktop."
+            )
+        }
+    } else if backend == BackendKind::Wayland && xwayland && session.info.xdisplay.is_none() {
+        "Call display_stop, then display_start with xwayland=true to add XWayland.".into()
+    } else {
+        "The running desktop already matches these settings; use it, or call display_stop first."
+            .into()
+    };
+    format!("{current}. {hint}")
 }
 
 impl Default for DisplayManager {

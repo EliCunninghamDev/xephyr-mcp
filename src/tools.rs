@@ -6,7 +6,7 @@ use crate::display::{DisplayManager, Session};
 use crate::env::Tool;
 use crate::mcp::CallResult;
 use crate::{a11y, input, proc, screenshot, trace, wait, x11};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
@@ -30,7 +30,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "display_start",
-            "Start a private, disposable desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other xephyr-mcp tool. Sessions are headless by default (visible=false); pass visible=true only when a person needs a watchable window on the host desktop. backend=\"x11\" (default) uses Xvfb when headless or Xephyr when visible. backend=\"wayland\" uses sway: headless by default, or a nested window on the host Wayland or X11 session when visible=true. X11 sessions get a window manager and private D-Bus/AT-SPI buses; Wayland sessions get sway, a private runtime dir, and the same private buses. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, backend, capabilities, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
+            "Start a private, disposable desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other xephyr-mcp tool. Sessions are headless by default (visible=false); pass visible=true only when a person needs a watchable window on the host desktop. backend=\"x11\" (default) uses Xvfb when headless or Xephyr when visible. backend=\"wayland\" uses sway: headless by default, or a nested window on the host Wayland or X11 session when visible=true. X11 sessions get a window manager and private D-Bus/AT-SPI buses; Wayland sessions get sway, a private runtime dir, and the same private buses. Each server process owns one display: calling display_start again with the same size/backend/visible returns the running session with already_running=true instead of failing, and can extend its watchdog with idle_timeout_secs/max_lifetime_secs. A different size returns an error explaining resize_display or display_stop. Set idle_timeout_secs=0 to disable the idle watchdog for long host-side work. Returns display, backend, capabilities, pids, dbus_address, runtime/log/home dirs, trace path, watchdog limits, and accessibility status.",
             schema(
                 json!({
                     "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen width in pixels (default 1280)" },
@@ -39,7 +39,9 @@ pub fn definitions() -> Vec<Value> {
                     "visible": { "type": "boolean", "description": "Run headless (false, default) or open a window on the host desktop (true); the latter is only for a person to watch or interact with the desktop" },
                     "xwayland": { "type": "boolean", "description": "wayland only: start XWayland so X11-only apps get a DISPLAY (default false; adds a host-global /tmp/.X11-unix socket)" },
                     "session_id": { "type": "string", "description": "Optional caller-supplied identifier (1-64 letters/digits/-_.). Used by the viewer and to keep multiple server instances apart. Generated if omitted." },
-                    "persist_home": { "type": "boolean", "description": "Keep HOME and XDG directories under the state dir keyed by session_id, so app profiles survive display_stop/display_start (default false)" }
+                    "persist_home": { "type": "boolean", "description": "Keep HOME and XDG directories under the state dir keyed by session_id, so app profiles survive display_stop/display_start (default false)" },
+                    "idle_timeout_secs": { "type": "integer", "minimum": 0, "maximum": 604800, "description": "Stop the desktop after this many seconds with no tool call (0 disables; default: XEPHYR_MCP_IDLE_TIMEOUT_SECS, or no timeout). A live process started with launch counts as activity. On a running desktop this updates the limit without restarting it." },
+                    "max_lifetime_secs": { "type": "integer", "minimum": 0, "maximum": 604800, "description": "Stop the desktop after this many seconds regardless of activity (0 disables; default: XEPHYR_MCP_MAX_LIFETIME_SECS, or no limit). On a running desktop this updates the limit without restarting it." }
                 }),
                 &[],
             ),
@@ -367,11 +369,23 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "trace_tail",
-            "Read the append-only JSONL tool trace for a session (or the newest trace when session_id is omitted). Each line records tool, sanitized arguments, duration, ok/error, and before/after frame hashes for screen-changing tools. Traces survive display_stop.",
+            "Read the append-only JSONL tool trace for a session (or the newest trace when session_id is omitted). Each line records tool, sanitized arguments, duration, ok/error plus a stable error_code, and before/after frame hashes for screen-changing tools. Lifecycle events such as session_stop and panic also appear here. Traces survive display_stop.",
             schema(
                 json!({
                     "session_id": { "type": "string", "description": "Session trace to read (default: newest trace file)" },
                     "lines": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Trailing lines (default 100)" }
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "trace_stats",
+            "Aggregate the tool traces into telemetry: call volume, failures and failure rate per tool, stable error_code counts, p50/p95/max duration, recent failures, and lifecycle stop reasons. Use this to find recurring failures and to see whether a desktop was stopped by the idle watchdog, a viewer request, or an explicit display_stop. Reads the newest traces unless session_id is given.",
+            schema(
+                json!({
+                    "session_id": { "type": "string", "description": "Only aggregate this session's trace" },
+                    "max_files": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Newest trace files to scan when session_id is omitted (default 200)" },
+                    "recent": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Recent failures to return (default 20)" }
                 }),
                 &[],
             ),
@@ -784,7 +798,53 @@ fn attach_step(
     }
 }
 
+/// Reject arguments the tool's schema does not declare.
+///
+/// The MCP SDK does not enforce `additionalProperties: false`, so without this
+/// a typo or an unsupported option is silently ignored.  That is exactly how a
+/// caller's `idle_timeout_secs` could be accepted and have no effect.
+fn validate_args(name: &str, args: &Value) -> Result<()> {
+    let definitions = definitions();
+    let Some(definition) = definitions
+        .iter()
+        .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+    else {
+        // The match below reports unknown tools with the tool list hint.
+        return Ok(());
+    };
+    let Some(provided) = args.as_object() else {
+        return Ok(());
+    };
+    let Some(properties) = definition
+        .get("inputSchema")
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = provided
+        .keys()
+        .filter(|key| !properties.contains_key(*key))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let expected: Vec<&str> = properties.keys().map(String::as_str).collect();
+    bail!(
+        "unknown argument{} for {name}: {}. Expected: {}",
+        if unknown.len() == 1 { "" } else { "s" },
+        unknown.join(", "),
+        if expected.is_empty() {
+            "(none)".to_string()
+        } else {
+            expected.join(", ")
+        }
+    )
+}
+
 async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<CallResult> {
+    validate_args(name, args)?;
     match name {
         "display_start" => {
             let width = opt_u64(args, "width").unwrap_or(1280) as u32;
@@ -802,6 +862,10 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let xwayland = opt_bool(args, "xwayland").unwrap_or(false);
             let session_id = opt_str(args, "session_id").map(str::to_string);
             let persist_home = opt_bool(args, "persist_home").unwrap_or(false);
+            let idle_timeout_secs =
+                opt_u64(args, "idle_timeout_secs").map(|value| value.min(604_800));
+            let max_lifetime_secs =
+                opt_u64(args, "max_lifetime_secs").map(|value| value.min(604_800));
             let report = manager
                 .start(
                     width,
@@ -811,6 +875,8 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                     persist_home,
                     backend,
                     xwayland,
+                    idle_timeout_secs,
+                    max_lifetime_secs,
                 )
                 .await?;
             Ok(CallResult::text(&report.to_json()))
@@ -1698,6 +1764,20 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 "text": text,
             })))
         }
+        "trace_stats" => {
+            let session_id = opt_str(args, "session_id").map(str::to_string);
+            if let Some(id) = &session_id {
+                crate::display::validate_session_id(id)?;
+            }
+            let max_files = opt_u64(args, "max_files").unwrap_or(200).clamp(1, 1000) as usize;
+            let recent = opt_u64(args, "recent").unwrap_or(20).clamp(1, 200) as usize;
+            let summary = tokio::task::spawn_blocking(move || {
+                trace::summary(session_id.as_deref(), max_files, recent)
+            })
+            .await
+            .context("trace stats task failed")?;
+            Ok(CallResult::text(&summary))
+        }
         "a11y_tree" => {
             let session = active(manager).await?;
             let max_depth = opt_u64(args, "max_depth").unwrap_or(12) as u32;
@@ -1744,10 +1824,40 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
 }
 
 async fn active(manager: &DisplayManager) -> Result<Arc<Session>> {
-    manager
-        .session()
-        .await
-        .ok_or_else(|| anyhow!("no nested display is running; call display_start first"))
+    if let Some(session) = manager.session().await {
+        return Ok(session);
+    }
+    let explanation = match manager.last_stop() {
+        Some(stop) => {
+            let when = stop.age_secs();
+            let reason = human_stop_reason(&stop.reason);
+            if stop.reason == "idle_timeout" {
+                format!(
+                    " The previous desktop ({}) was stopped {when}s ago by the idle timeout. Call display_start again; pass idle_timeout_secs=0 (or a larger value) to keep it alive during long host-side work.",
+                    stop.display
+                )
+            } else {
+                format!(
+                    " The previous desktop ({}) was stopped {when}s ago ({reason}). Call display_start again.",
+                    stop.display
+                )
+            }
+        }
+        None => " Call display_start first.".to_string(),
+    };
+    Err(anyhow!("no display is running.{explanation}"))
+}
+
+fn human_stop_reason(reason: &str) -> &str {
+    match reason {
+        "idle_timeout" => "idle timeout",
+        "max_lifetime" => "maximum lifetime",
+        "viewer_request" => "viewer request",
+        "signal" => "server signal",
+        "server_exit" => "server exit",
+        "requested" => "display_stop",
+        other => other,
+    }
 }
 
 fn xdotool(manager: &DisplayManager) -> Result<crate::env::Tool> {
@@ -1995,8 +2105,17 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "control": session_control.owner.as_str(),
             "control_pid": (session_control.owner == Owner::Human).then_some(session_control.pid),
             "launched": session.launch_count(),
+            "running_launches": session.live_launch_count(),
+            "idle_timeout_secs": session.idle_timeout().map(|value| value.as_secs()),
+            "max_lifetime_secs": session.max_lifetime().map(|value| value.as_secs()),
+            "idle_remaining_secs": manager.idle_remaining(session),
+            "uptime_secs": crate::state::now().saturating_sub(session.info.started_at),
         })
     });
+
+    let telemetry = tokio::task::spawn_blocking(|| trace::summary(None, 100, 10))
+        .await
+        .ok();
 
     json!({
         "ok": missing.is_empty(),
@@ -2014,6 +2133,8 @@ async fn diagnose(manager: &DisplayManager) -> Value {
         "max_lifetime_secs": manager.max_lifetime.map(|value| value.as_secs()),
         "python_atspi": gi,
         "active_session": active,
+        "last_stop": manager.last_stop().map(|stop| stop.to_json()),
+        "telemetry": telemetry,
         "sessions_on_host": crate::state::list_sessions().len(),
         "tools": tools,
         "missing": missing,
@@ -2023,9 +2144,12 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "The nested desktop defaults to X11; backend=wayland uses sway with output capture, sway-IPC window control, display resize, virtual pointer/keyboard input, and the data-control clipboard.",
             "A viewer claims human control with c; wait_for_control blocks until it is released, and input/a11y tools are refused meanwhile.",
             "AT-SPI requires PyGObject in the python3 environment (python_atspi).",
-            "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
+            "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS set the default watchdog; display_start can override them per session, and 0 disables a limit.",
+            "A live process started with launch counts as activity, so the idle watchdog does not kill a desktop while an application is still running.",
+            "last_stop explains why the previous desktop ended; the same reason is included in no-display errors.",
             "Set persist_home=true to keep app profiles across display_stop/display_start with the same session_id.",
             "Set XEPHYR_MCP_TRACE_SCREENSHOTS=1 to save before/after PNGs next to the JSONL trace (newest 400 kept per session).",
+            "trace_stats aggregates failures, error codes, latency, and stop reasons across traces.",
         ],
     })
 }
@@ -2137,4 +2261,38 @@ fn clamp_i16(value: i64) -> Result<i16> {
 
 fn clamp_u16(value: i64) -> Result<u16> {
     u16::try_from(value).map_err(|_| anyhow!("dimension {value} is outside the X11 range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unknown_arguments_are_rejected() {
+        let error = validate_args("screenshot", &json!({"idle_timeout_secs": 5}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown argument"));
+        assert!(error.contains("idle_timeout_secs"));
+    }
+
+    #[test]
+    fn declared_arguments_are_accepted() {
+        assert!(validate_args(
+            "display_start",
+            &json!({
+                "width": 640,
+                "height": 480,
+                "idle_timeout_secs": 60,
+                "max_lifetime_secs": 0,
+            }),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unknown_tools_are_left_to_the_dispatcher() {
+        assert!(validate_args("not_a_tool", &json!({"x": 1})).is_ok());
+    }
 }
